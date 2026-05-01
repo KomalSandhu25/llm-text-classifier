@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.local
+
+# ML artifacts
+mlruns/
+mlartifacts/
+models/
+checkpoints/
+*.onnx
+*.pt
+*.bin
+
+# Data
+data/raw/
+data/processed/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
