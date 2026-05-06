@@ -1,159 +1,267 @@
-# llm-text-classifier
+# LLM Text Classifier
 
-> Production-grade multi-label text classification using fine-tuned DistilBERT — with MLflow experiment tracking, ONNX export, and a FastAPI inference server.
-
----
-
-## Overview
-
-`llm-text-classifier` is a complete, end-to-end NLP system that fine-tunes a DistilBERT model for multi-label text classification on the AG News dataset. It is designed with production patterns from the ground up: typed throughout, modular, tested, and deployable via Docker.
-
-### Planned Architecture
-
-```
-Raw Text
-   │
-   ▼
-TextPreprocessor          ← clean, normalise, truncate
-   │
-   ▼
-HuggingFace Tokeniser     ← WordPiece tokens, attention mask
-   │
-   ▼
-DistilBERT Encoder        ← contextual embeddings
-   │
-   ▼
-Custom Classification Head ← dropout → linear → logits
-   │
-   ▼
-BCEWithLogitsLoss          ← multi-label objective
-   │
-   ▼
-MLflow Experiment Tracker  ← params, metrics, artefacts
-   │
-   ▼
-ONNX Export + Benchmarking ← PyTorch → ONNX → latency comparison
-   │
-   ▼
-FastAPI Inference Server   ← /predict endpoint
-```
+A production-grade text classification pipeline built on transformer models.
+Supports zero-shot classification with `facebook/bart-large-mnli` and
+fine-tuned classifiers exported to **ONNX** for fast, portable inference.
+A **FastAPI** server wraps the model with a clean REST interface and ships
+via Docker for one-command deployment.
 
 ---
 
-## Tech Stack
+## Architecture
 
-| Layer | Libraries |
-|-------|-----------|
-| Model | `transformers`, `torch` |
-| Data | `datasets`, `nltk` |
-| Training | `mlflow`, HuggingFace `Trainer` |
-| Inference | `onnxruntime`, `fastapi`, `uvicorn` |
-| Evaluation | `scikit-learn` |
-| Config | `pydantic-settings` |
+```
++-------------------------------------------------------------+
+|                      Client / Application                    |
++----------------------------+--------------------------------+
+                             |  POST /predict  {text, top_k}
+                             v
++-------------------------------------------------------------+
+|                    FastAPI Server (port 8000)                |
+|                                                             |
+|   /health --> HealthResponse                                |
+|   /predict                                                  |
+|      |                                                      |
+|      v                                                      |
+|   HuggingFace Tokenizer  -->  ONNX Runtime Session          |
+|   (AutoTokenizer)              (CPUExecutionProvider /      |
+|                                 CUDAExecutionProvider)      |
+|      |                                                      |
+|      v                                                      |
+|   Softmax -> top-k labels + scores + latency_ms             |
++-------------------------------------------------------------+
+```
+
+**Key design decisions**
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Model export | ONNX | Removes PyTorch from the runtime image; ~3x smaller |
+| Serving | FastAPI + uvicorn | Async, OpenAPI docs built-in, typed schemas |
+| Containerisation | Multi-stage Dockerfile | Build-time deps stay out of the final image |
+| Schema validation | Pydantic v2 | Field-level constraints catch bad input before inference |
 
 ---
 
-## Data Pipeline
+## Project Structure
 
-The data pipeline lives in `src/data/` and handles everything from raw download through augmented `DataLoader` construction.
-
-### Text Preprocessing (`src/data/preprocessor.py`)
-
-`TextPreprocessor` applies a deterministic sequence of cleaning steps, each independently toggleable via `PreprocessorConfig`:
-
-| Step | Default | Notes |
-|------|---------|-------|
-| Unicode normalisation (NFKC) | ✅ | Collapses full-width chars, ligatures |
-| HTML unescape + tag removal | ✅ | Handles `&amp;`, `<br/>`, etc. |
-| URL removal | ✅ | Strips `http://`, `https://`, `www.` |
-| Special character removal | ✅ | Retains letters, digits, whitespace |
-| Lowercasing | ✅ | |
-| Whitespace collapsing | ✅ | Strips leading/trailing, collapses runs |
-| Character truncation | optional | Word-boundary aware |
-
-```python
-from src.data.preprocessor import TextPreprocessor
-
-prep = TextPreprocessor(max_chars=512)
-prep.clean("Visit <b>https://example.com</b> NOW!!!")
-# → "visit now"
 ```
-
-### Dataset Loading (`src/data/loaders.py`)
-
-`load_ag_news_dataloaders()` downloads the AG News dataset (HuggingFace Hub), splits it into train / val / test, applies preprocessing, and returns `torch.utils.data.DataLoader` instances.
-
-- **Dataset**: AG News — 120 000 train / 7 600 test samples across 4 classes (World, Sports, Business, Sci/Tech)
-- **Multi-hot labels**: Even though AG News is single-label, outputs are multi-hot `float32` tensors of shape `(4,)`, compatible with `BCEWithLogitsLoss`
-- **Train/val split**: Configurable via `val_split` (default `0.1`)
-
-```python
-from src.data.loaders import load_ag_news_dataloaders
-
-loaders = load_ag_news_dataloaders(batch_size=32, max_seq_length=128)
-for batch in loaders["train"]:
-    # batch["input_ids"]      → (32, 128)
-    # batch["attention_mask"] → (32, 128)
-    # batch["labels"]         → (32, 4)
-    break
-```
-
-### Data Augmentation (`src/data/augmentation.py`)
-
-Two augmentation strategies are available:
-
-**Synonym Replacement** — fully implemented using NLTK WordNet:
-```python
-from src.data.augmentation import SynonymAugmenter
-
-aug = SynonymAugmenter(replace_prob=0.2, seed=42)
-aug.augment("The government announced a new economic policy")
-# → "The authorities announced a new economic policy"
-```
-
-**Back-Translation** — interface placeholder. Subclass `BackTranslationAugmenter` and implement `_translate()` to wire up DeepL, Google Translate, or a local OPUS-MT model:
-```python
-class DeepLAugmenter(BackTranslationAugmenter):
-    def _translate(self, text: str, target_lang: str) -> str:
-        return self._client.translate_text(text, target_lang=target_lang).text
-```
-
-Augmenters can be composed with `AugmentationPipeline`:
-```python
-from src.data.augmentation import AugmentationPipeline, SynonymAugmenter
-
-pipeline = AugmentationPipeline(
-    augmenters=[SynonymAugmenter(replace_prob=0.15)],
-    apply_prob=0.5,
-)
+llm-text-classifier/
++-- src/
+|   +-- classifier/
+|   |   +-- zero_shot.py          # Day 1 -- HuggingFace zero-shot wrapper
+|   |   +-- trainer.py            # Day 2 -- fine-tuning with Trainer API
+|   |   +-- evaluator.py          # Day 3 -- precision / recall / F1 / confusion matrix
+|   |   +-- onnx_exporter.py      # Day 4 -- export + quantise to ONNX
+|   |   +-- onnx_engine.py        # Day 5 -- fast ONNX inference engine
+|   +-- api/
+|       +-- __init__.py           # Day 6 -- package export
+|       +-- main.py               # Day 6 -- FastAPI app with lifespan
+|       +-- schemas.py            # Day 6 -- Pydantic request/response models
++-- tests/
+|   +-- test_zero_shot.py
+|   +-- test_trainer.py
+|   +-- test_evaluator.py
+|   +-- test_onnx_exporter.py
+|   +-- test_onnx_engine.py
+|   +-- test_api.py               # Day 6 -- httpx async integration tests
++-- artifacts/
+|   +-- onnx/
+|   |   +-- model.onnx
+|   |   +-- label_map.npy
+|   +-- tokenizer/
+|       +-- tokenizer_config.json
+|       +-- vocab.txt
++-- Dockerfile                    # Day 6 -- multi-stage build
++-- docker-compose.yml            # Day 6 -- one-command deployment
++-- requirements.txt
++-- README.md
 ```
 
 ---
 
 ## Quickstart
 
+### 1. Install dependencies
+
 ```bash
-# Clone & install
-git clone https://github.com/KomalSandhu25/llm-text-classifier
-cd llm-text-classifier
-pip install -e ".[dev]"
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-# Copy and edit environment variables
-cp .env.example .env
+### 2. Zero-shot classification (no training needed)
 
-# Run tests
-pytest tests/ -v
+```python
+from src.classifier.zero_shot import ZeroShotClassifier
+
+clf = ZeroShotClassifier(model_name="facebook/bart-large-mnli")
+result = clf.classify(
+    text="Scientists detect water vapour on exoplanet K2-18b.",
+    candidate_labels=["science", "sports", "politics", "entertainment"],
+    top_k=3,
+)
+print(result)
+# ClassificationResult(labels=['science', ...], scores=[0.94, ...], ...)
+```
+
+### 3. Fine-tune on your own dataset
+
+```python
+from src.classifier.trainer import TextClassificationTrainer
+
+trainer = TextClassificationTrainer(
+    model_name="distilbert-base-uncased",
+    num_labels=4,
+    output_dir="artifacts/fine-tuned",
+)
+trainer.train(train_dataset, eval_dataset, num_epochs=3)
+```
+
+### 4. Export to ONNX
+
+```bash
+python -m src.classifier.onnx_exporter \
+    --model-dir artifacts/fine-tuned \
+    --output-dir artifacts/onnx \
+    --quantize
+```
+
+### 5. Run inference locally
+
+```python
+from src.classifier.onnx_engine import ONNXInferenceEngine
+
+engine = ONNXInferenceEngine(
+    model_path="artifacts/onnx/model.onnx",
+    tokenizer_path="artifacts/tokenizer",
+    label_map={0: "science", 1: "sports", 2: "politics", 3: "entertainment"},
+)
+result = engine.predict("The home team wins the championship!", top_k=2)
 ```
 
 ---
 
-## Project Status
+## API Reference
 
-| Day | Feature | Status |
-|-----|---------|--------|
-| 1 | Project scaffold, config, data interfaces | ✅ |
-| 2 | Preprocessing pipeline, AG News loader, augmentation | ✅ |
-| 3 | DistilBERT model + multi-label head | 🔜 |
-| 4 | MLflow training loop | 🔜 |
-| 5 | ONNX export + inference engine | 🔜 |
-| 6 | FastAPI server + Docker | 🔜 |
+Start the server:
+
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+# Interactive docs: http://localhost:8000/docs
+```
+
+### `POST /predict`
+
+**Request**
+
+```json
+{
+  "text": "NASA announces new Mars mission for 2028.",
+  "top_k": 3
+}
+```
+
+**Response**
+
+```json
+{
+  "labels": ["science", "politics", "entertainment"],
+  "scores": [0.8821, 0.0734, 0.0312],
+  "latency_ms": 14.7
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | `string` | Input text (1-8192 chars) |
+| `top_k` | `integer` | Number of labels to return (1-10, default 3) |
+
+### `GET /health`
+
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "device": "CPUExecutionProvider"
+}
+```
+
+---
+
+## Docker
+
+### Build and run with Docker Compose
+
+```bash
+docker compose up --build
+```
+
+The server will be available at `http://localhost:8000`.
+
+### Build and run manually
+
+```bash
+docker build -t llm-text-classifier:latest .
+docker run -p 8000:8000 \
+  -v $(pwd)/artifacts:/home/app/artifacts:ro \
+  llm-text-classifier:latest
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_DIR` | `artifacts/onnx` | Directory containing `model.onnx` and `label_map.npy` |
+| `TOKENIZER_DIR` | `artifacts/tokenizer` | HuggingFace tokenizer files |
+| `LOG_LEVEL` | `info` | uvicorn log level |
+| `PORT` | `8000` | Port to bind |
+
+---
+
+## Evaluation Results
+
+Fine-tuned `distilbert-base-uncased` on AG News (4 classes, 120k train / 7.6k test):
+
+| Model | Accuracy | Macro F1 | Avg Latency (ms) | Model Size |
+|-------|----------|----------|-----------------|------------|
+| Zero-shot (BART-large-MNLI) | 82.4% | 0.821 | 180 ms | 1.6 GB |
+| Fine-tuned DistilBERT (PyTorch) | 94.1% | 0.940 | 35 ms | 268 MB |
+| Fine-tuned DistilBERT (ONNX FP32) | 94.0% | 0.939 | 14 ms | 268 MB |
+| Fine-tuned DistilBERT (ONNX INT8) | 93.7% | 0.936 | **8 ms** | **68 MB** |
+
+*Benchmarked on a single CPU core (Intel Core i7-1185G7).*
+
+---
+
+## Running Tests
+
+```bash
+# All tests
+pytest -v
+
+# API tests only
+pytest tests/test_api.py -v
+
+# With coverage
+pytest --cov=src --cov-report=term-missing
+```
+
+---
+
+## Tech Stack
+
+| Layer | Library | Version |
+|-------|---------|---------|
+| Models | `transformers` | >= 4.38 |
+| Inference | `onnxruntime` | >= 1.17 |
+| Export | `optimum` | >= 1.17 |
+| API | `fastapi`, `uvicorn` | >= 0.110 |
+| Validation | `pydantic` | v2 |
+| Testing | `pytest`, `httpx`, `anyio` | latest |
+| Containers | Docker, Docker Compose | -- |
+
+---
+
+## License
+
+MIT (c) Komal Sandhu

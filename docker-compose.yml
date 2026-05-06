@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: llm-text-classifier:latest
+    container_name: text-classifier
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_DIR: artifacts/onnx
+      TOKENIZER_DIR: artifacts/tokenizer
+      LOG_LEVEL: info
+      PORT: 8000
+    volumes:
+      - ./artifacts:/home/app/artifacts:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
